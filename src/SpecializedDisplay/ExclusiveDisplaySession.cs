@@ -131,7 +131,9 @@ public sealed class ExclusiveDisplaySession : IDisposable
     // The context the consumer draws onto this frame: the live display context when owned, else the idle
     // canvas (a discarded WARP target used between acquire attempts). Set by BeginFrame; exposed via Dc.
     private ID2D1DeviceContext? _activeDc;
-    private IdleCanvas? _idle;   // lazily created on the first not-owned frame; lives until Dispose.
+    private IdleCanvas? _idle;         // lazily created on the first not-owned frame; lives until Dispose.
+    private bool _idleCanvasFailed;    // WARP idle canvas couldn't be built — fall back to in-call blocking.
+    private bool _frameHadRecoveryBackoff; // this frame already slept a backoff — don't also idle-throttle.
     // Countdown of upcoming presents that must be full redraws. Set to BufferCount on (re)acquire so
     // EVERY freshly-allocated (garbage) primary is painted before the render-on-change loop can idle
     // and later flip to a never-drawn buffer. Self-decrementing via ConsumeForceRedraw.
@@ -181,6 +183,12 @@ public sealed class ExclusiveDisplaySession : IDisposable
         return true;
     }
 
+    /// <summary>Request a one-shot readback of the next presented frame. If called while NOT owned
+    /// (recovering / escalating), the request is <b>deferred</b>, not serviced against the idle canvas:
+    /// the readback only runs on an owned present (see <see cref="CaptureIfPending"/>), so it always
+    /// captures the real panel — never the discarded not-owned scaffold. On the first owned frame after a
+    /// re-acquire the force-redraw guarantees a fully painted primary, so the captured frame is never
+    /// garbage. If ownership is never restored, the pending request is simply never serviced.</summary>
     public void RequestCapture(Action<CapturedFrame> onCaptured) => _pendingCapture = onCaptured;
 
     // ---- typed events (replace the app's direct IPC sends; the app forwards them verbatim) ----
@@ -207,24 +215,43 @@ public sealed class ExclusiveDisplaySession : IDisposable
         // backoff sleep — and carry the attempt state across frames in _reacquire. The caller's heartbeat
         // keeps beating between attempts. StepRecovery may restore ownership, stay pending, or (genuine
         // recovery exhausted) throw DisplayRecoveryFailedException.
+        _frameHadRecoveryBackoff = false;
         MaybeStartRecovery();
         if (_reacquire.Active)
             StepRecovery();
 
         if (_owned)
         {
-            _dc.Target = _target2d[_back]; // draw into the BACK buffer (never the one being scanned out)
-            _dc.BeginDraw();
-            _dc.Transform = _transform; // logical portrait -> physical landscape
-            _dc.TextAntialiasMode = TextAntialiasMode.Grayscale;
-            _activeDc = _dc;
+            SetupOwnedFrame();
+            return;
+        }
+
+        // Not owned this frame: hand the caller the idle canvas so its unconditional Draw is safe. The
+        // frame is discarded (no scanout) — see EndFramePresent's not-owned path. IsOwned stays false.
+        var idle = BeginIdleFrame();
+        if (idle is not null)
+        {
+            _activeDc = idle;
         }
         else
         {
-            // Not owned this frame: hand the caller the idle canvas so its unconditional Draw is safe. The
-            // frame is discarded (no scanout) — see EndFramePresent's not-owned path. IsOwned stays false.
-            _activeDc = BeginIdleFrame();
+            // Idle canvas unavailable (best-effort scaffolding, not a correctness dependency — see
+            // BeginIdleFrame). We cannot hand back a valid not-owned target, so finish this recovery INSIDE
+            // this call (degrading to the pre-spread in-call blocking) rather than return a null Dc. Never
+            // an NRE, never a null Dc: DrainRecoveryBlocking makes us owned or throws.
+            DrainRecoveryBlocking();
+            SetupOwnedFrame();
         }
+    }
+
+    /// <summary>Point the live display context at the back buffer and open the frame. Owned path only.</summary>
+    private void SetupOwnedFrame()
+    {
+        _dc.Target = _target2d[_back]; // draw into the BACK buffer (never the one being scanned out)
+        _dc.BeginDraw();
+        _dc.Transform = _transform; // logical portrait -> physical landscape
+        _dc.TextAntialiasMode = TextAntialiasMode.Grayscale;
+        _activeDc = _dc;
     }
 
     public void EndFramePresent()
@@ -273,7 +300,9 @@ public sealed class ExclusiveDisplaySession : IDisposable
 
     /// <summary>Read back the just-drawn back primary and hand the caller an UPRIGHT logical-orientation
     /// BGRA frame. Off the hot path (pending-only) and fully guarded — a readback OR callback failure is
-    /// logged and swallowed so it can never disturb presentation.</summary>
+    /// logged and swallowed so it can never disturb presentation. Called ONLY from the owned present path,
+    /// so a capture requested while not owned stays pending until the panel is back (never reads the idle
+    /// canvas).</summary>
     private void CaptureIfPending()
     {
         if (_pendingCapture is not { } callback) return;
@@ -293,9 +322,22 @@ public sealed class ExclusiveDisplaySession : IDisposable
     // ---- not-owned frame: a discarded draw target so the caller's render loop keeps running safely while
     //      a spread reacquire/escalation makes at most one attempt per frame ----
 
-    private ID2D1DeviceContext BeginIdleFrame()
+    /// <summary>Begin a discarded frame on the idle canvas and return its context, or null if the idle
+    /// canvas cannot be built. The idle canvas is BEST-EFFORT scaffolding, not a correctness dependency:
+    /// WARP creation essentially never fails on a supported Windows install, but if it does we record it
+    /// once and the caller falls back to in-call blocking (see BeginFrame / DrainRecoveryBlocking).</summary>
+    private ID2D1DeviceContext? BeginIdleFrame()
     {
-        _idle ??= new IdleCanvas(_physW, _physH); // physical dims from the last acquire; the target is discarded
+        if (_idle is null && !_idleCanvasFailed)
+        {
+            try { _idle = new IdleCanvas(_physW, _physH); } // physical dims from the last acquire; target is discarded
+            catch (Exception ex)
+            {
+                _idleCanvasFailed = true;
+                _log?.Invoke(LogLevel.Error, $"idle canvas unavailable ({ex.Message}); recovery will block in-call and may exit on exhaustion");
+            }
+        }
+        if (_idle is null) return null;
         _idle.Begin(_transform);
         return _idle.Context;
     }
@@ -303,9 +345,27 @@ public sealed class ExclusiveDisplaySession : IDisposable
     private void EndIdleFrame()
     {
         _idle?.End();
-        // Throttle so a dirty-flooding caller doesn't spin attempts back-to-back — the one attempt (and its
-        // bounded backoff) already ran in BeginFrame. Same idle cadence as the background throttle.
-        Thread.Sleep(_options.BackgroundSleepMs);
+        // WATCHDOG BUDGET: at most ONE sleep per frame. If this frame already backed off after a recovery
+        // attempt, don't stack the idle throttle on top of it (backoff <= ReacquireBackoffMaxMs ~0.8s keeps
+        // the whole BeginFrame+EndFramePresent cycle well under ~1.5s). Otherwise this is a pure idle frame
+        // (e.g. waiting between wake-escalation windows) — throttle so the caller doesn't spin drawing
+        // discarded frames. Same idle cadence as the background throttle.
+        if (!_frameHadRecoveryBackoff)
+            Thread.Sleep(_options.BackgroundSleepMs);
+    }
+
+    /// <summary>Fallback when the idle canvas is unavailable: finish the active recovery episode INSIDE the
+    /// current BeginFrame (the pre-spread in-call blocking) so we never hand back a null Dc. This can breach
+    /// the watchdog budget — acceptable only because it is unreachable on a healthy Windows install (WARP
+    /// is always present). Genuine exhaustion throws inside StepRecovery; a wake episode that exhausts ends
+    /// (Active=false) not-owned, so we throw here too — degrading the never-throw escalation to an exit,
+    /// which is the correct outcome when we also cannot scaffold a not-owned frame.</summary>
+    private void DrainRecoveryBlocking()
+    {
+        while (_reacquire.Active && !_owned)
+            StepRecovery();
+        if (!_owned)
+            throw new DisplayRecoveryFailedException("re-acquire failed and the idle canvas is unavailable");
     }
 
     // ---- present-path helpers ----
@@ -581,9 +641,12 @@ public sealed class ExclusiveDisplaySession : IDisposable
         switch (_reacquire.Failed())
         {
             case ReacquireFailAction.Backoff:
-                // The ONLY per-frame retry sleep, bounded by ReacquireBackoffMaxMs (~0.8s) — far under the
-                // watchdog budget. The next attempt runs on the next frame (idle frames keep heartbeating).
+                // WATCHDOG BUDGET: this is the ONLY sleep on a recovering frame — one attempt plus this one
+                // backoff, bounded by ReacquireBackoffMaxMs (~0.8s). The flag suppresses EndIdleFrame's idle
+                // throttle so the two never stack, keeping the whole cycle well under ~1.5s. The next
+                // attempt runs on the NEXT frame, so the caller heartbeats between attempts.
                 Thread.Sleep(_reacquire.BackoffMs());
+                _frameHadRecoveryBackoff = true;
                 break;
             case ReacquireFailAction.Fatal:
                 _log?.Invoke(LogLevel.Error, $"re-acquire exhausted after {attempt} attempts; exiting for supervisor restart: {last.Message}");

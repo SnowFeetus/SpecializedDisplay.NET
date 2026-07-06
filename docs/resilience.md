@@ -105,7 +105,14 @@ renderer killed (observed on hardware, 2026-07-06). So the loop is now **spread 
 - Because the caller draws unconditionally after `BeginFrame` (there is no `IsOwned` gate in the hot
   loop), a not-owned frame is handed an **idle canvas** — a discarded WARP-backed D2D target (see
   `IdleCanvas`, built lazily and independent of the display adapter so it survives a real device-removed).
-  The frame is drawn and thrown away; nothing is scanned out; `IsOwned`/`IsReleased` stay `false`.
+  The frame is drawn and thrown away; nothing is scanned out; `IsOwned`/`IsReleased` stay `false`. The
+  idle canvas is **best-effort scaffolding, not a correctness dependency**: if WARP creation itself fails
+  (essentially never on a supported Windows install), the session degrades that episode to the old in-call
+  blocking — it finishes the attempts inside the one `BeginFrame` and throws `DisplayRecoveryFailedException`
+  on exhaustion. Never an NRE, never a null `Dc`.
+- At most **one sleep per recovering frame**: a frame that backed off after an attempt does not also run
+  the idle throttle, so a full `BeginFrame`+`EndFramePresent` cycle stays comfortably under ~1.5 s
+  worst-case.
 
 Preserved semantics of the bounded reacquire:
 
@@ -129,6 +136,20 @@ released, `BeginFrame`/`EndFramePresent` throw `InvalidOperationException`. A la
 the latch and runs the standard acquire, including the **force-redraw + fresh pacing/fence-revive
 state reset** — so a re-acquired session never flips to a stale, never-drawn primary. This lets a host
 hand the panel to another process (or park it) and reclaim it later on the same session instance.
+
+## Known residuals
+
+- **Cooperative `Acquire()` still blocks in-call.** The explicit initial/resume `Acquire()` keeps its
+  inner `AcquireAttempts` retry loop (design decision #3) — it is NOT spread across frames, because it is
+  called by the host off the frame heartbeat (e.g. a shell resume), not from inside `BeginFrame`. On a
+  deeply sleeping target a single `Acquire()` can therefore take several seconds. That is acceptable: the
+  resume path is shell-mediated and the host reports `acquire_failed` and retries, so it self-heals at the
+  protocol level. Only the in-frame recovery/escalation path carries the strict one-attempt-per-frame
+  budget.
+- **Capture during recovery is deferred.** `RequestCapture` while not owned does not read back the idle
+  canvas; the readback runs only on an owned present, so it always captures the real panel (fully painted,
+  thanks to the post-reacquire force-redraw). If ownership is never restored, the request is simply never
+  serviced (the capture client times out benignly).
 
 ## Tunables
 
