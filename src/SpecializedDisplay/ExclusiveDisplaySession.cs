@@ -111,6 +111,11 @@ public sealed class ExclusiveDisplaySession : IDisposable
     // The same retry runs while merely backgrounded, covering a fence that free-runs instead.
     private bool _fenceDied;    // fence pacing lost mid-flight (vs never available at acquire)
     private double _reviveAtMs; // next fence-rebuild attempt on the pace clock (0 = none scheduled)
+    // WHICH flavor of death we saw (hardware-verified 2026-07-06). The rebuild recovers "stopped
+    // advancing" on wake, but NEVER the device-removed sentinel (a slept panel that ignored desktop
+    // wake) — that flavor escalates to a full release + re-acquire (see the wake-escalation path).
+    private FenceDeathFlavor _fenceDeathFlavor;
+    private double _nextWakeEscalationMs; // next wake-escalation attempt on the pace clock (0 = none)
 
     private ID2D1Factory1 _d2dFactory = null!;
     private ID2D1Device _d2dDevice = null!;
@@ -120,6 +125,13 @@ public sealed class ExclusiveDisplaySession : IDisposable
     private bool _owned;
     private bool _needReacquire;
     private bool _released;   // cooperative-release latch (NEW)
+
+    // Bounded reacquire + wake escalation, spread ONE attempt per frame (watchdog budget — see BeginFrame).
+    private readonly ReacquirePlan _reacquire;
+    // The context the consumer draws onto this frame: the live display context when owned, else the idle
+    // canvas (a discarded WARP target used between acquire attempts). Set by BeginFrame; exposed via Dc.
+    private ID2D1DeviceContext? _activeDc;
+    private IdleCanvas? _idle;   // lazily created on the first not-owned frame; lives until Dispose.
     // Countdown of upcoming presents that must be full redraws. Set to BufferCount on (re)acquire so
     // EVERY freshly-allocated (garbage) primary is painted before the render-on-change loop can idle
     // and later flip to a never-drawn buffer. Self-decrementing via ConsumeForceRedraw.
@@ -143,11 +155,15 @@ public sealed class ExclusiveDisplaySession : IDisposable
         _flipY = options.FlipY;
         _targetFrameMs = 1000.0 / options.RefreshHz;
         _instantWaitMs = _targetFrameMs * options.InstantWaitFraction;
+        _reacquire = new ReacquirePlan(options.ReacquireAttempts, options.ReacquireBackoffBaseMs, options.ReacquireBackoffMaxMs);
     }
 
     // ---- state ----
 
-    public ID2D1DeviceContext Dc => _dc;
+    // The context whose target is the current frame's framebuffer. While owned this is the live display
+    // context; between acquire attempts (not owned) it is the idle canvas set by BeginFrame. Falls back
+    // to the live context before the first frame.
+    public ID2D1DeviceContext Dc => _activeDc ?? _dc;
     public Size PhysicalSize => new(_physW, _physH);
     public Size LogicalSize
     {
@@ -183,18 +199,38 @@ public sealed class ExclusiveDisplaySession : IDisposable
     {
         AssertThread();
         if (_released) throw new InvalidOperationException("session is released; call Acquire() first.");
-        if (_needReacquire)
-            Reacquire();
 
-        _dc.Target = _target2d[_back]; // draw into the BACK buffer (never the one being scanned out)
-        _dc.BeginDraw();
-        _dc.Transform = _transform; // logical portrait -> physical landscape
-        _dc.TextAntialiasMode = TextAntialiasMode.Grayscale;
+        // WATCHDOG-BUDGET INVARIANT (docs/resilience.md): no single BeginFrame may block anywhere near the
+        // supervisor's ~5s "frozen" threshold. Recovery (a present-detected loss) and wake escalation (a
+        // persistently dead fence) both re-acquire the target, which on a sleeping/contended panel can cost
+        // seconds PER attempt. So we perform AT MOST ONE acquire attempt here — plus at most one bounded
+        // backoff sleep — and carry the attempt state across frames in _reacquire. The caller's heartbeat
+        // keeps beating between attempts. StepRecovery may restore ownership, stay pending, or (genuine
+        // recovery exhausted) throw DisplayRecoveryFailedException.
+        MaybeStartRecovery();
+        if (_reacquire.Active)
+            StepRecovery();
+
+        if (_owned)
+        {
+            _dc.Target = _target2d[_back]; // draw into the BACK buffer (never the one being scanned out)
+            _dc.BeginDraw();
+            _dc.Transform = _transform; // logical portrait -> physical landscape
+            _dc.TextAntialiasMode = TextAntialiasMode.Grayscale;
+            _activeDc = _dc;
+        }
+        else
+        {
+            // Not owned this frame: hand the caller the idle canvas so its unconditional Draw is safe. The
+            // frame is discarded (no scanout) — see EndFramePresent's not-owned path. IsOwned stays false.
+            _activeDc = BeginIdleFrame();
+        }
     }
 
     public void EndFramePresent()
     {
         if (_released) throw new InvalidOperationException("session is released; call Acquire() first.");
+        if (!_owned) { EndIdleFrame(); return; } // recovering/escalating: discard the throwaway draw, throttle
         try
         {
             _dc.EndDraw();
@@ -216,7 +252,7 @@ public sealed class ExclusiveDisplaySession : IDisposable
             var task = _taskPool.CreateTask();
             task.SetScanout(scanout);
             var result = _taskPool.TryExecuteTask(task);
-            if (!EvaluatePresent(result)) return; // recovery pending; keep _back so Reacquire resets it
+            if (!EvaluatePresent(result)) return; // recovery pending; keep _back so the rebuild (BuildGpuState) resets it
 
             // 3) Pace to the next V-blank — the flip to the back buffer completes here, which is also
             //    when the previously-displayed buffer stops being scanned and becomes free to reuse.
@@ -254,6 +290,24 @@ public sealed class ExclusiveDisplaySession : IDisposable
         }
     }
 
+    // ---- not-owned frame: a discarded draw target so the caller's render loop keeps running safely while
+    //      a spread reacquire/escalation makes at most one attempt per frame ----
+
+    private ID2D1DeviceContext BeginIdleFrame()
+    {
+        _idle ??= new IdleCanvas(_physW, _physH); // physical dims from the last acquire; the target is discarded
+        _idle.Begin(_transform);
+        return _idle.Context;
+    }
+
+    private void EndIdleFrame()
+    {
+        _idle?.End();
+        // Throttle so a dirty-flooding caller doesn't spin attempts back-to-back — the one attempt (and its
+        // bounded backoff) already ran in BeginFrame. Same idle cadence as the background throttle.
+        Thread.Sleep(_options.BackgroundSleepMs);
+    }
+
     // ---- present-path helpers ----
 
     private void PaceToVBlank()
@@ -272,7 +326,12 @@ public sealed class ExclusiveDisplaySession : IDisposable
             _paceClock.Elapsed.TotalMilliseconds >= _reviveAtMs)
         {
             _reviveAtMs = _paceClock.Elapsed.TotalMilliseconds + _options.FenceReviveIntervalMs;
-            TryReviveFencePacing();
+            // The device-removed sentinel flavor is NEVER fixed by a rebuild (a rebuilt fence just
+            // re-sentinels, which would also keep resetting the wake-escalation timer) — leave that flavor
+            // to the wake escalation (see BeginFrame/StepRecovery). The stopped-advancing flavor and a
+            // free-running (backgrounded) fence still rebuild here.
+            if (_fenceDeathFlavor != FenceDeathFlavor.DeviceRemovedSentinel)
+                TryReviveFencePacing();
         }
 
         if (_background)
@@ -305,12 +364,14 @@ public sealed class ExclusiveDisplaySession : IDisposable
             {
                 // Not an actual device removal (that path triggers recovery): the fence itself
                 // died, typically because the display was powered off. Degrade + schedule revive.
-                if (!CheckDeviceRemoved()) DegradeFencePacing("CompletedValue = device-removed sentinel");
+                // This sentinel flavor is NOT recovered by rebuilding the fence (hardware-verified
+                // 2026-07-06) — it drives the wake escalation.
+                if (!CheckDeviceRemoved()) DegradeFencePacing(FenceDeathFlavor.DeviceRemovedSentinel, "CompletedValue = device-removed sentinel");
                 return;
             }
             _periodicD3D.SetEventOnCompletion(v + 1, _vblankEvent);
             if (!_vblankEvent.WaitOne(_options.VBlankFenceTimeoutMs) && !CheckDeviceRemoved())
-                DegradeFencePacing("periodic fence stopped advancing");
+                DegradeFencePacing(FenceDeathFlavor.StoppedAdvancing, "periodic fence stopped advancing");
             return;
         }
 
@@ -323,15 +384,23 @@ public sealed class ExclusiveDisplaySession : IDisposable
     }
 
     /// <summary>The periodic fence stopped delivering vblanks (display power-off is the known cause).
-    /// Drop to throttled fence-less pacing and schedule rebuild attempts.</summary>
-    private void DegradeFencePacing(string reason)
+    /// Drop to throttled fence-less pacing and schedule rebuild attempts. Remembers the death
+    /// <paramref name="flavor"/>: the sentinel flavor is unrecoverable by rebuild and, after
+    /// <see cref="AcquireOptions.FenceDeadReacquireAfterMs"/>, escalates to a release + re-acquire.</summary>
+    private void DegradeFencePacing(FenceDeathFlavor flavor, string reason)
     {
         _useFencePacing = false;
         _fenceDied = true;
+        _fenceDeathFlavor = flavor;
         _periodicD3D?.Dispose(); _periodicD3D = null!;
         _vblankEvent?.Dispose(); _vblankEvent = null!;
         _periodicFence = null!;
         _reviveAtMs = _paceClock.Elapsed.TotalMilliseconds + _options.FenceReviveIntervalMs;
+        // Schedule the first wake escalation FenceDeadReacquireAfterMs out (only the sentinel flavor
+        // will actually escalate; see BeginFrame). 0 disables escalation.
+        _nextWakeEscalationMs = _options.FenceDeadReacquireAfterMs > 0
+            ? _paceClock.Elapsed.TotalMilliseconds + _options.FenceDeadReacquireAfterMs
+            : 0;
         _log?.Invoke(LogLevel.Warn, $"periodic fence dead ({reason}); display power-off? throttling and rebuilding every {_options.FenceReviveIntervalMs / 1000:0}s");
     }
 
@@ -349,6 +418,8 @@ public sealed class ExclusiveDisplaySession : IDisposable
             if (_useFencePacing)
             {
                 _fenceDied = false;
+                _fenceDeathFlavor = FenceDeathFlavor.None;
+                _nextWakeEscalationMs = 0; // rebuild worked — cancel any pending wake escalation
                 _log?.Invoke(LogLevel.Info, "periodic fence rebuilt (display power recovery); pacing resumes on the next blocking wait");
             }
         }
@@ -441,60 +512,147 @@ public sealed class ExclusiveDisplaySession : IDisposable
     // ---- acquire / release ----
 
     // In-process recovery handles the common transient case (brief ownership loss, momentary
-    // source-in-use). It is intentionally BOUNDED and short (< ~3s of backoff) so BeginFrame never
-    // blocks past a typical supervisor's 5s "frozen" threshold. If it can't recover quickly, we throw
-    // and let the host exit — a supervisor owns persistent-failure restart with backoff + crash-loop
-    // breaking, which is the right layer for a genuinely absent/held panel.
+    // source-in-use) and wake escalation handles a slept panel (device-removed-sentinel fence). Both
+    // re-acquire the target. Historically the whole bounded loop ran INSIDE one BeginFrame; on a
+    // sleeping/contended panel the cumulative API + backoff time blew past the supervisor's ~5s watchdog
+    // and the process was killed. Now the loop is spread ONE attempt per frame (see BeginFrame's
+    // invariant) via _reacquire, so the caller's heartbeat keeps beating between attempts:
+    //   * Genuine — a present-detected device/ownership loss. Bounded to ReacquireAttempts; on exhaustion
+    //               THROWS DisplayRecoveryFailedException out of BeginFrame so the host exits for its
+    //               supervisor to own persistent-failure restart (backoff + crash-loop breaking).
+    //   * Wake    — a persistently dead device-removed-sentinel fence (a slept panel). NEVER throws; on
+    //               exhaustion it reschedules and stays throttled (a sleeping panel is not fatal).
 
-    private void Reacquire()
+    /// <summary>Start a recovery episode if one is pending and none is running. A present-detected loss
+    /// (<see cref="ReacquireMode.Genuine"/>) takes precedence over a wake escalation
+    /// (<see cref="ReacquireMode.Wake"/>), which becomes due once the fence has been dead in the
+    /// device-removed-sentinel flavor past <see cref="AcquireOptions.FenceDeadReacquireAfterMs"/>. On the
+    /// first step of an episode, <see cref="ReleaseGraphics"/> relinquishes the lost/sleeping target —
+    /// required before a re-acquire can restore scanout (hardware-verified 2026-07-06).</summary>
+    private void MaybeStartRecovery()
     {
-        _needReacquire = false;
-        ReleaseGraphics();
-        Exception? last = null;
-        for (int attempt = 1; attempt <= _options.ReacquireAttempts; attempt++)
+        if (_reacquire.Active) return;
+        if (_needReacquire)
         {
-            try
-            {
-                Acquire();
-                Reacquired?.Invoke(attempt);
-                _log?.Invoke(LogLevel.Info, $"re-acquired display target after {attempt} attempt(s)");
-                return;
-            }
-            catch (TargetNotFoundException ex)
-            {
-                last = ex;
-                if (attempt == 1) TargetOffDesktop?.Invoke("display target not present");
-                ReleaseGraphics();
-                Thread.Sleep(Math.Min(_options.ReacquireBackoffMaxMs, _options.ReacquireBackoffBaseMs * attempt));
-            }
-            catch (Exception ex)
-            {
-                last = ex;
-                _log?.Invoke(LogLevel.Warn, $"re-acquire attempt {attempt} failed: {ex.Message}");
-                ReleaseGraphics();
-                Thread.Sleep(Math.Min(_options.ReacquireBackoffMaxMs, _options.ReacquireBackoffBaseMs * attempt));
-            }
+            _needReacquire = false;
+            _reacquire.Start(ReacquireMode.Genuine);
+        }
+        else if (WakeEscalation.IsDue(_fenceDeathFlavor, _paceClock.Elapsed.TotalMilliseconds,
+                     _nextWakeEscalationMs, _options.FenceDeadReacquireAfterMs))
+        {
+            _log?.Invoke(LogLevel.Warn, "fence dead (device-removed sentinel) past escalation threshold; releasing + re-acquiring to wake the panel");
+            _reacquire.Start(ReacquireMode.Wake);
+        }
+        else return;
+
+        ReleaseGraphics(); // give up the lost/sleeping target before the first attempt
+    }
+
+    /// <summary>Perform EXACTLY ONE acquire attempt for the active recovery episode, then return so the
+    /// caller's heartbeat can beat. On success raises <see cref="Reacquired"/> (after the ModeApplied +
+    /// Acquired that <see cref="BuildGpuState"/> raises, matching the original event order); on failure
+    /// backs off (bounded) and stays pending, or terminates the episode (throw for Genuine, reschedule
+    /// for Wake).</summary>
+    private void StepRecovery()
+    {
+        int attempt = _reacquire.BeginAttempt();
+        try
+        {
+            AttemptAcquireOnceAndBuild(); // fresh manager + one TryAcquire/TryApply; builds GPU state on success
+            _reacquire.Succeeded();
+            Reacquired?.Invoke(attempt);
+            _log?.Invoke(LogLevel.Info, $"re-acquired display target after {attempt} attempt(s)");
+        }
+        catch (TargetNotFoundException ex)
+        {
+            if (attempt == 1) TargetOffDesktop?.Invoke("display target not present");
+            HandleAttemptFailure(attempt, ex);
+        }
+        catch (Exception ex)
+        {
+            _log?.Invoke(LogLevel.Warn, $"re-acquire attempt {attempt} failed: {ex.Message}");
+            HandleAttemptFailure(attempt, ex);
+        }
+    }
+
+    private void HandleAttemptFailure(int attempt, Exception last)
+    {
+        ReleaseGraphics(); // clean any partial state the failed attempt left before the next one
+        switch (_reacquire.Failed())
+        {
+            case ReacquireFailAction.Backoff:
+                // The ONLY per-frame retry sleep, bounded by ReacquireBackoffMaxMs (~0.8s) — far under the
+                // watchdog budget. The next attempt runs on the next frame (idle frames keep heartbeating).
+                Thread.Sleep(_reacquire.BackoffMs());
+                break;
+            case ReacquireFailAction.Fatal:
+                _log?.Invoke(LogLevel.Error, $"re-acquire exhausted after {attempt} attempts; exiting for supervisor restart: {last.Message}");
+                throw new DisplayRecoveryFailedException(last.Message);
+            case ReacquireFailAction.Reschedule:
+                // Wake escalation exhausted — a sleeping panel is not fatal. Reschedule the next escalation
+                // and stay not-owned + throttled; the idle frames keep the caller heartbeating.
+                _nextWakeEscalationMs = _paceClock.Elapsed.TotalMilliseconds + _options.FenceDeadReacquireAfterMs;
+                _log?.Invoke(LogLevel.Warn, $"wake escalation exhausted after {attempt} attempts; staying throttled, retry in {_options.FenceDeadReacquireAfterMs / 1000:0}s: {last.Message}");
+                break;
+        }
+    }
+
+    /// <summary>One acquire attempt: a fresh <see cref="DisplayManager"/>, a single target resolve +
+    /// TryAcquire + mode find + TryApply, and on success the full GPU/display rebuild via
+    /// <see cref="BuildGpuState"/>. This is the single-attempt sibling of <see cref="Acquire"/>'s inner
+    /// loop (spread one attempt per frame per the watchdog budget) — keep the two in sync. Throws on any
+    /// failure so <see cref="StepRecovery"/> counts it as a failed attempt.</summary>
+    private void AttemptAcquireOnceAndBuild()
+    {
+        var (key, _) = SpecializedDisplays.ResolveKey(_selector);
+        _mgr = DisplayManager.Create(DisplayManagerOptions.EnforceSourceOwnership);
+
+        var target = SpecializedDisplays.ResolveTarget(_mgr, key, _selector);
+        if (target is null)
+            throw new TargetNotFoundException("display target not found (won't touch other displays).");
+
+        var acq = _mgr.TryAcquireTargetsAndCreateEmptyState(new[] { target });
+        if (acq.ErrorCode != DisplayManagerResult.Success)
+        {
+            // TargetAccessDenied == another client holds the source (VIDPN_SOURCE_IN_USE); surface it as
+            // the acquire loop does, then fail this attempt (the next frame retries after the backoff).
+            if (acq.ErrorCode == DisplayManagerResult.TargetAccessDenied)
+                OwnershipLost?.Invoke($"acquire: {acq.ErrorCode}");
+            throw new AcquireFailedException($"TryAcquire failed ({acq.ErrorCode}).");
         }
 
-        _log?.Invoke(LogLevel.Error, $"re-acquire exhausted after {_options.ReacquireAttempts} attempts; exiting for supervisor restart: {last?.Message}");
-        throw new DisplayRecoveryFailedException(last?.Message ?? "re-acquire failed");
+        var state = acq.State;
+        var path = state.ConnectTarget(target);
+        var mode = FindMatchingMode(path);
+        if (mode is null)
+            throw new ModeNotFoundException("no mode matched the configured selector.");
+
+        path.ApplyPropertiesFromMode(mode);
+        var apply = state.TryApply(DisplayStateApplyOptions.FailIfStateChanged);
+        if (apply.Status != DisplayStateOperationStatus.Success)
+            throw new AcquireFailedException($"TryApply failed ({apply.Status}).");
+
+        BuildGpuState(target, mode);
     }
 
     /// <summary>Acquire (or re-acquire) exclusive ownership and rebuild all GPU/display state. Clears
     /// a prior cooperative <see cref="Release"/>. Raises <see cref="ModeApplied"/> then
     /// <see cref="Acquired"/>. Throws <see cref="TargetNotFoundException"/>, <see cref="ModeNotFoundException"/>,
-    /// or <see cref="AcquireFailedException"/>.</summary>
+    /// or <see cref="AcquireFailedException"/>.
+    /// <para>This is the blocking initial/cooperative-resume path: it retries the inner TryAcquire/TryApply
+    /// up to <see cref="AcquireOptions.AcquireAttempts"/> times WITHIN this one call (design decision #3 —
+    /// callers invoke it explicitly, off the frame heartbeat). The spread, one-attempt-per-frame recovery
+    /// and wake-escalation path uses <see cref="AttemptAcquireOnceAndBuild"/> instead.</para></summary>
     public void Acquire()
     {
         AssertThread();
         _released = false;
+        _reacquire.Reset(); // an explicit (re)acquire supersedes any in-flight spread recovery episode
 
         var (key, _) = SpecializedDisplays.ResolveKey(_selector);
         _mgr = DisplayManager.Create(DisplayManagerOptions.EnforceSourceOwnership);
 
         DisplayTarget? target = null;
-        DisplayState? state = null;
-        DisplayPath? path = null;
         DisplayModeInfo? applied = null;
         for (int attempt = 1; attempt <= _options.AcquireAttempts; attempt++)
         {
@@ -513,20 +671,9 @@ public sealed class ExclusiveDisplaySession : IDisposable
                 continue;
             }
 
-            state = acq.State;
-            path = state.ConnectTarget(target);
-
-            DisplayModeInfo? mode = null;
-            foreach (var mi in path.FindModes(DisplayModeQueryOptions.None))
-            {
-                var rate = mi.PresentationRate.VerticalSyncRate;
-                double hz = rate.Denominator != 0 ? (double)rate.Numerator / rate.Denominator : 0.0;
-                var desc = new DisplayModeDescriptor(
-                    mi.SourceResolution.Width, mi.SourceResolution.Height,
-                    mi.TargetResolution.Width, mi.TargetResolution.Height,
-                    mi.SourcePixelFormat, hz);
-                if (_options.ModeSelector(desc)) { mode = mi; break; }
-            }
+            var state = acq.State;
+            var path = state.ConnectTarget(target);
+            var mode = FindMatchingMode(path);
             if (mode is null)
                 throw new ModeNotFoundException("no mode matched the configured selector.");
 
@@ -534,15 +681,41 @@ public sealed class ExclusiveDisplaySession : IDisposable
             var apply = state.TryApply(DisplayStateApplyOptions.FailIfStateChanged);
             if (apply.Status == DisplayStateOperationStatus.Success) { applied = mode; break; }
 
-            state = null; path = null;
             if (attempt == _options.AcquireAttempts)
                 throw new AcquireFailedException($"TryApply never succeeded (last={apply.Status}).");
         }
 
-        _target = target!;
+        BuildGpuState(target!, applied!);
+    }
+
+    /// <summary>Select the first enumerated mode matching <see cref="AcquireOptions.ModeSelector"/>, or
+    /// null if none matches. Shared by <see cref="Acquire"/> and <see cref="AttemptAcquireOnceAndBuild"/>.</summary>
+    private DisplayModeInfo? FindMatchingMode(DisplayPath path)
+    {
+        foreach (var mi in path.FindModes(DisplayModeQueryOptions.None))
+        {
+            var rate = mi.PresentationRate.VerticalSyncRate;
+            double hz = rate.Denominator != 0 ? (double)rate.Numerator / rate.Denominator : 0.0;
+            var desc = new DisplayModeDescriptor(
+                mi.SourceResolution.Width, mi.SourceResolution.Height,
+                mi.TargetResolution.Width, mi.TargetResolution.Height,
+                mi.SourcePixelFormat, hz);
+            if (_options.ModeSelector(desc)) return mi;
+        }
+        return null;
+    }
+
+    /// <summary>Rebuild all GPU/display state for a target whose mode has just been applied, and mark the
+    /// session owned. Shared by the blocking <see cref="Acquire"/> and the spread
+    /// <see cref="AttemptAcquireOnceAndBuild"/>. Raises <see cref="ModeApplied"/> then
+    /// <see cref="Acquired"/>, and resets the force-redraw, pacing, fence-revive AND wake-escalation state
+    /// so a re-acquired session never flips to a stale primary or carries a stale recovery timer.</summary>
+    private void BuildGpuState(DisplayTarget target, DisplayModeInfo applied)
+    {
+        _target = target;
 
         // Physical framebuffer dims come from the applied mode (the source resolution we draw into).
-        _physW = applied!.SourceResolution.Width;
+        _physW = applied.SourceResolution.Width;
         _physH = applied.SourceResolution.Height;
         _transform = DisplayTransform.Compute(_rot, _flipX, _flipY, _physW, _physH);
         _fullDirty = new[] { new RectInt32 { X = 0, Y = 0, Width = _physW, Height = _physH } };
@@ -608,6 +781,7 @@ public sealed class ExclusiveDisplaySession : IDisposable
         _forceRedraw = _options.BufferCount; // every fresh primary contains garbage — force one full redraw EACH
         _background = false; _instantWaits = 0; _lastPaceEndMs = double.NegativeInfinity; // fresh pacing state
         _fenceDied = false; _reviveAtMs = 0;                                              // fresh fence-revive state
+        _fenceDeathFlavor = FenceDeathFlavor.None; _nextWakeEscalationMs = 0;             // fresh wake-escalation state
         Acquired?.Invoke();
     }
 
@@ -620,6 +794,7 @@ public sealed class ExclusiveDisplaySession : IDisposable
         ReleaseGraphics();
         _released = true;
         _needReacquire = false;
+        _reacquire.Reset(); // abandon any in-flight spread recovery/escalation — the caller is parking us
         Released?.Invoke();
     }
 
@@ -646,6 +821,7 @@ public sealed class ExclusiveDisplaySession : IDisposable
     private void ReleaseGraphics()
     {
         _owned = false;
+        _activeDc = null; // drop the reference to the live context we are about to dispose (Dc falls back to _dc==null)
         if (_target2d != null) { foreach (var t in _target2d) t?.Dispose(); _target2d = null!; }
         _dc?.Dispose(); _dc = null!;
         _d2dDevice?.Dispose(); _d2dDevice = null!;
@@ -667,7 +843,11 @@ public sealed class ExclusiveDisplaySession : IDisposable
         _mgr?.Dispose(); _mgr = null!;
     }
 
-    public void Dispose() => ReleaseGraphics();
+    public void Dispose()
+    {
+        ReleaseGraphics();
+        _idle?.Dispose(); _idle = null; // the persistent not-owned fallback lives until the session is torn down
+    }
 
     private static (ID3D11Device, ID3D11DeviceContext, ID3D11Device1) CreateD3D11OnAdapter(long luid)
     {
