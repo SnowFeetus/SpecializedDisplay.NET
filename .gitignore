@@ -1,0 +1,15 @@
+# .NET / MSBuild build output
+**/bin/
+**/obj/
+
+# Visual Studio / IDE
+.vs/
+*.user
+*.suo
+
+# OS cruft
+Thumbs.db
+desktop.ini
+
+# Logs
+*.log
