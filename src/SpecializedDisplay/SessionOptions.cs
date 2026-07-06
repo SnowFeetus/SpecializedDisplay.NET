@@ -47,6 +47,16 @@ public sealed class AcquireOptions
     // Dead-fence revive (hardware-verified 2026-07-04: display power-off can kill the periodic fence).
     public double FenceReviveIntervalMs { get; init; } = 5000;
 
+    // Wake escalation (hardware-verified 2026-07-06). The periodic fence can die in two flavors: it can
+    // stop advancing (DPMS-ish — the FenceReviveIntervalMs rebuild recovers it on wake), or it can report
+    // the device-removed SENTINEL (CompletedValue == ulong.MaxValue with the device NOT actually removed)
+    // — a slept panel that ignores desktop wake. The latter flavor is NEVER recovered by rebuilding the
+    // fence: only a full Release()+Acquire() (mode re-apply) restores scanout. When the fence has been
+    // dead in the sentinel flavor for longer than this and the rebuilds have not helped, the session
+    // escalates to an internal release + re-acquire, retried on this same cadence. 0 disables escalation
+    // (fall back to rebuild-only). A sleeping panel is not fatal, so this path never throws.
+    public double FenceDeadReacquireAfterMs { get; init; } = 15000;
+
     // Fence waits.
     public int RenderFenceTimeoutMs { get; init; } = 500;
     public int VBlankFenceTimeoutMs { get; init; } = 500;
