@@ -747,9 +747,9 @@ public sealed class ExclusiveDisplaySession : IDisposable
                 throw new ModeNotFoundException("no mode matched the configured selector.");
 
             path.ApplyPropertiesFromMode(mode);
-            var status = ApplyStateForced(state);
-            if (status != DisplayStateOperationStatus.Success)
-                throw new AcquireFailedException($"TryApply failed ({status}).");
+            var apply = state.TryApply(DisplayStateApplyOptions.FailIfStateChanged);
+            if (apply.Status != DisplayStateOperationStatus.Success)
+                throw new AcquireFailedException($"TryApply failed ({apply.Status}).");
 
             BuildGpuState(target, mode);
         }
@@ -810,42 +810,17 @@ public sealed class ExclusiveDisplaySession : IDisposable
             }
 
             path.ApplyPropertiesFromMode(mode);
-            var status = ApplyStateForced(state);
-            if (status == DisplayStateOperationStatus.Success) { applied = mode; break; }
+            var apply = state.TryApply(DisplayStateApplyOptions.FailIfStateChanged);
+            if (apply.Status == DisplayStateOperationStatus.Success) { applied = mode; break; }
 
             if (attempt == _options.AcquireAttempts)
             {
                 TryReleaseTargetQuiet(target); // ditto — owned but unusable
-                throw new AcquireFailedException($"TryApply never succeeded (last={status}).");
+                throw new AcquireFailedException($"TryApply never succeeded (last={apply.Status}).");
             }
         }
 
         BuildGpuState(target!, applied!);
-    }
-
-    /// <summary>Apply the display state with <see cref="DisplayStateApplyOptions.ForceReapply"/> — a
-    /// switch handoff re-applies the SAME mode the released owner was scanning, and without the force
-    /// the OS treats the identical modeset as a no-op: the path is never re-driven and the glass never
-    /// latches onto the new owner's surfaces (frozen old image before the explicit ReleaseTarget, black
-    /// after it — hardware-traced 2026-07-06) while every present succeeds. Boot acquires latch because
-    /// the path starts disabled, making the apply a real modeset; this makes every acquire look like
-    /// boot. Falls back to a plain apply on failure so the previously-working acquire-while-display-off
-    /// paths (wake escalation on a sleeping panel) are never regressed by the forced variant.</summary>
-    private DisplayStateOperationStatus ApplyStateForced(DisplayState state)
-    {
-        var apply = state.TryApply(DisplayStateApplyOptions.FailIfStateChanged | DisplayStateApplyOptions.ForceReapply);
-        if (apply.Status == DisplayStateOperationStatus.Success) return apply.Status;
-        if (apply.Status == DisplayStateOperationStatus.SystemStateChanged)
-        {
-            // Stale snapshot (the released owner's hand-off races our acquire): let the caller's
-            // retry loop rebuild the state and re-apply FORCED. Falling back here would "succeed"
-            // as a no-op modeset and silently un-fix the handoff latch.
-            _log?.Invoke(LogLevel.Warn, "forced mode re-apply hit SystemStateChanged; retrying with a fresh state");
-            return apply.Status;
-        }
-        _log?.Invoke(LogLevel.Warn, $"forced mode re-apply failed ({apply.Status}); falling back to a plain apply");
-        apply = state.TryApply(DisplayStateApplyOptions.FailIfStateChanged);
-        return apply.Status;
     }
 
     /// <summary>Select the first enumerated mode matching <see cref="AcquireOptions.ModeSelector"/>, or
