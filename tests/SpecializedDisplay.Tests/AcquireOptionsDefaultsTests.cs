@@ -20,6 +20,7 @@ public class AcquireOptionsDefaultsTests
     [Fact] public void BackgroundSleepMs_Default() => Assert.Equal(200, Defaults().BackgroundSleepMs);
     [Fact] public void FenceReviveIntervalMs_Default() => Assert.Equal(5000, Defaults().FenceReviveIntervalMs);
     [Fact] public void FenceDeadReacquireAfterMs_Default() => Assert.Equal(15000, Defaults().FenceDeadReacquireAfterMs);
+    [Fact] public void ConsoleWakeGraceMs_Default() => Assert.Equal(2000, Defaults().ConsoleWakeGraceMs);
     [Fact] public void RenderFenceTimeoutMs_Default() => Assert.Equal(500, Defaults().RenderFenceTimeoutMs);
     [Fact] public void VBlankFenceTimeoutMs_Default() => Assert.Equal(500, Defaults().VBlankFenceTimeoutMs);
     [Fact] public void AcquireAttempts_Default() => Assert.Equal(6, Defaults().AcquireAttempts);

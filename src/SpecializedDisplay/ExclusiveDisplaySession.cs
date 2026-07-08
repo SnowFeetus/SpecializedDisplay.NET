@@ -117,6 +117,14 @@ public sealed class ExclusiveDisplaySession : IDisposable
     private FenceDeathFlavor _fenceDeathFlavor;
     private double _nextWakeEscalationMs; // next wake-escalation attempt on the pace clock (0 = none)
 
+    // Console-wake path (see ConsoleDisplayWatcher): a desktop wake never re-powers a specialized
+    // target, so when the console display comes back ON while pacing says the panel is dark, we arm
+    // a short deadline; if pacing hasn't recovered by itself when it fires, we release + re-acquire
+    // (the mode re-apply re-powers scanout — the hardware-verified way to re-light a dark panel on
+    // an awake desktop). Null watcher = disabled (option 0) or registration failed.
+    private readonly ConsoleDisplayWatcher? _consoleWatcher;
+    private double _consoleWakeAtMs; // armed console-wake deadline on the pace clock (0 = none)
+
     private ID2D1Factory1 _d2dFactory = null!;
     private ID2D1Device _d2dDevice = null!;
     private ID2D1DeviceContext _dc = null!;
@@ -158,6 +166,14 @@ public sealed class ExclusiveDisplaySession : IDisposable
         _targetFrameMs = 1000.0 / options.RefreshHz;
         _instantWaitMs = _targetFrameMs * options.InstantWaitFraction;
         _reacquire = new ReacquirePlan(options.ReacquireAttempts, options.ReacquireBackoffBaseMs, options.ReacquireBackoffMaxMs);
+        if (options.ConsoleWakeGraceMs > 0)
+        {
+            try { _consoleWatcher = new ConsoleDisplayWatcher(); }
+            catch (Exception ex)
+            {
+                _log?.Invoke(LogLevel.Warn, $"console display watcher unavailable ({ex.Message}); wake-on-console-on disabled");
+            }
+        }
     }
 
     // ---- state ----
@@ -592,6 +608,7 @@ public sealed class ExclusiveDisplaySession : IDisposable
     private void MaybeStartRecovery()
     {
         if (_reacquire.Active) return;
+        UpdateConsoleWakeHint();
         if (_needReacquire)
         {
             _needReacquire = false;
@@ -603,9 +620,40 @@ public sealed class ExclusiveDisplaySession : IDisposable
             _log?.Invoke(LogLevel.Warn, "fence dead (device-removed sentinel) past escalation threshold; releasing + re-acquiring to wake the panel");
             _reacquire.Start(ReacquireMode.Wake);
         }
+        else if (_consoleWakeAtMs > 0 && _paceClock.Elapsed.TotalMilliseconds >= _consoleWakeAtMs)
+        {
+            _consoleWakeAtMs = 0;
+            _log?.Invoke(LogLevel.Warn, "display-off throttle persisted after the console display came on; releasing + re-acquiring to re-light the panel");
+            _reacquire.Start(ReacquireMode.Wake);
+        }
         else return;
 
         ReleaseGraphics(); // give up the lost/sleeping target before the first attempt
+    }
+
+    /// <summary>Console-wake arming (see <see cref="ConsoleDisplayWatcher"/>). A known-off → on
+    /// console transition while pacing says the panel is dark arms a <see
+    /// cref="AcquireOptions.ConsoleWakeGraceMs"/> deadline; pacing that recovers by itself within the
+    /// grace (a merely-backgrounded session reconnecting) disarms it, otherwise
+    /// <see cref="MaybeStartRecovery"/> escalates to the Wake release + re-acquire whose mode
+    /// re-apply re-powers the panel's scanout.</summary>
+    private void UpdateConsoleWakeHint()
+    {
+        if (_consoleWatcher is null) return;
+        bool panelDark = _fenceDied || _background || !_owned;
+        if (_consoleWatcher.ConsumeDisplayTurnedOn())
+        {
+            if (panelDark && _consoleWakeAtMs <= 0)
+            {
+                _consoleWakeAtMs = _paceClock.Elapsed.TotalMilliseconds + _options.ConsoleWakeGraceMs;
+                _log?.Invoke(LogLevel.Info, $"console display turned on while display-off throttled; re-acquiring in {_options.ConsoleWakeGraceMs / 1000.0:0.#}s unless vblank pacing resumes");
+            }
+        }
+        else if (_consoleWakeAtMs > 0 && !panelDark)
+        {
+            _consoleWakeAtMs = 0;
+            _log?.Invoke(LogLevel.Info, "vblank pacing resumed within the console-wake grace; re-acquire cancelled");
+        }
     }
 
     /// <summary>Perform EXACTLY ONE acquire attempt for the active recovery episode, then return so the
@@ -655,6 +703,12 @@ public sealed class ExclusiveDisplaySession : IDisposable
                 // Wake escalation exhausted — a sleeping panel is not fatal. Reschedule the next escalation
                 // and stay not-owned + throttled; the idle frames keep the caller heartbeating.
                 _nextWakeEscalationMs = _paceClock.Elapsed.TotalMilliseconds + _options.FenceDeadReacquireAfterMs;
+                // A console-wake-triggered episode has a flavor the sentinel timer above ignores, so
+                // re-arm the console deadline on the same cadence — a still-dark panel keeps retrying
+                // while the desktop is awake instead of going silent until the next console transition.
+                if (!WakeEscalation.FlavorEscalates(_fenceDeathFlavor)
+                    && _consoleWatcher is not null && _options.FenceDeadReacquireAfterMs > 0)
+                    _consoleWakeAtMs = _paceClock.Elapsed.TotalMilliseconds + _options.FenceDeadReacquireAfterMs;
                 _log?.Invoke(LogLevel.Warn, $"wake escalation exhausted after {attempt} attempts; staying throttled, retry in {_options.FenceDeadReacquireAfterMs / 1000:0}s: {last.Message}");
                 break;
         }
@@ -685,17 +739,29 @@ public sealed class ExclusiveDisplaySession : IDisposable
         }
 
         var state = acq.State;
-        var path = state.ConnectTarget(target);
-        var mode = FindMatchingMode(path);
-        if (mode is null)
-            throw new ModeNotFoundException("no mode matched the configured selector.");
+        try
+        {
+            var path = state.ConnectTarget(target);
+            var mode = FindMatchingMode(path);
+            if (mode is null)
+                throw new ModeNotFoundException("no mode matched the configured selector.");
 
-        path.ApplyPropertiesFromMode(mode);
-        var apply = state.TryApply(DisplayStateApplyOptions.FailIfStateChanged);
-        if (apply.Status != DisplayStateOperationStatus.Success)
-            throw new AcquireFailedException($"TryApply failed ({apply.Status}).");
+            path.ApplyPropertiesFromMode(mode);
+            var status = ApplyStateForced(state);
+            if (status != DisplayStateOperationStatus.Success)
+                throw new AcquireFailedException($"TryApply failed ({status}).");
 
-        BuildGpuState(target, mode);
+            BuildGpuState(target, mode);
+        }
+        catch (Exception) when (!ReferenceEquals(_target, target))
+        {
+            // Acquired but never installed as session state (_target unset, so the failure path's
+            // ReleaseGraphics can't see it): hand it back here, or the OS keeps this process as the
+            // owner and the wedged handoff outlives the recovery. BuildGpuState sets _target first,
+            // so any throw past that point is covered by ReleaseGraphics instead.
+            TryReleaseTargetQuiet(target);
+            throw;
+        }
     }
 
     /// <summary>Acquire (or re-acquire) exclusive ownership and rebuild all GPU/display state. Clears
@@ -738,17 +804,48 @@ public sealed class ExclusiveDisplaySession : IDisposable
             var path = state.ConnectTarget(target);
             var mode = FindMatchingMode(path);
             if (mode is null)
+            {
+                TryReleaseTargetQuiet(target); // acquired this iteration; hand it back before bailing
                 throw new ModeNotFoundException("no mode matched the configured selector.");
+            }
 
             path.ApplyPropertiesFromMode(mode);
-            var apply = state.TryApply(DisplayStateApplyOptions.FailIfStateChanged);
-            if (apply.Status == DisplayStateOperationStatus.Success) { applied = mode; break; }
+            var status = ApplyStateForced(state);
+            if (status == DisplayStateOperationStatus.Success) { applied = mode; break; }
 
             if (attempt == _options.AcquireAttempts)
-                throw new AcquireFailedException($"TryApply never succeeded (last={apply.Status}).");
+            {
+                TryReleaseTargetQuiet(target); // ditto — owned but unusable
+                throw new AcquireFailedException($"TryApply never succeeded (last={status}).");
+            }
         }
 
         BuildGpuState(target!, applied!);
+    }
+
+    /// <summary>Apply the display state with <see cref="DisplayStateApplyOptions.ForceReapply"/> — a
+    /// switch handoff re-applies the SAME mode the released owner was scanning, and without the force
+    /// the OS treats the identical modeset as a no-op: the path is never re-driven and the glass never
+    /// latches onto the new owner's surfaces (frozen old image before the explicit ReleaseTarget, black
+    /// after it — hardware-traced 2026-07-06) while every present succeeds. Boot acquires latch because
+    /// the path starts disabled, making the apply a real modeset; this makes every acquire look like
+    /// boot. Falls back to a plain apply on failure so the previously-working acquire-while-display-off
+    /// paths (wake escalation on a sleeping panel) are never regressed by the forced variant.</summary>
+    private DisplayStateOperationStatus ApplyStateForced(DisplayState state)
+    {
+        var apply = state.TryApply(DisplayStateApplyOptions.FailIfStateChanged | DisplayStateApplyOptions.ForceReapply);
+        if (apply.Status == DisplayStateOperationStatus.Success) return apply.Status;
+        if (apply.Status == DisplayStateOperationStatus.SystemStateChanged)
+        {
+            // Stale snapshot (the released owner's hand-off races our acquire): let the caller's
+            // retry loop rebuild the state and re-apply FORCED. Falling back here would "succeed"
+            // as a no-op modeset and silently un-fix the handoff latch.
+            _log?.Invoke(LogLevel.Warn, "forced mode re-apply hit SystemStateChanged; retrying with a fresh state");
+            return apply.Status;
+        }
+        _log?.Invoke(LogLevel.Warn, $"forced mode re-apply failed ({apply.Status}); falling back to a plain apply");
+        apply = state.TryApply(DisplayStateApplyOptions.FailIfStateChanged);
+        return apply.Status;
     }
 
     /// <summary>Select the first enumerated mode matching <see cref="AcquireOptions.ModeSelector"/>, or
@@ -797,6 +894,7 @@ public sealed class ExclusiveDisplaySession : IDisposable
 
         _taskPool = _displayDevice.CreateTaskPool();
         _source = _displayDevice.CreateScanoutSource(_target);
+        LogSourceStatus("acquire");
         var primaryDesc = new DisplayPrimaryDescription((uint)_physW, (uint)_physH,
             DirectXPixelFormat.B8G8R8A8UIntNormalized,
             DirectXColorSpace.RgbFullG22NoneP709,
@@ -845,6 +943,7 @@ public sealed class ExclusiveDisplaySession : IDisposable
         _background = false; _instantWaits = 0; _lastPaceEndMs = double.NegativeInfinity; // fresh pacing state
         _fenceDied = false; _reviveAtMs = 0;                                              // fresh fence-revive state
         _fenceDeathFlavor = FenceDeathFlavor.None; _nextWakeEscalationMs = 0;             // fresh wake-escalation state
+        _consoleWakeAtMs = 0;                                                             // fresh console-wake state
         Acquired?.Invoke();
     }
 
@@ -857,6 +956,7 @@ public sealed class ExclusiveDisplaySession : IDisposable
         ReleaseGraphics();
         _released = true;
         _needReacquire = false;
+        _consoleWakeAtMs = 0;   // a parked session must not wake itself on a console transition
         _reacquire.Reset(); // abandon any in-flight spread recovery/escalation — the caller is parking us
         Released?.Invoke();
     }
@@ -901,14 +1001,54 @@ public sealed class ExclusiveDisplaySession : IDisposable
         _d3d1?.Dispose(); _d3d1 = null!;
         _d3dContext?.Dispose(); _d3dContext = null!;
         _d3dDevice?.Dispose(); _d3dDevice = null!;
-        // DisplayDevice/TaskPool/Source/Surface are WinRT and released with the manager.
-        _displayDevice = null!; _taskPool = null!; _source = null!; _primary = null!; _target = null!;
+        // DisplayDevice/TaskPool/Source/Surface are WinRT but NOT IClosable: dropping the refs only
+        // queues their native releases for finalization. So are the per-frame scanout + task
+        // objects — hours of ownership accumulate millions of them. A re-acquiring process whose
+        // OLD kernel display device (and scanout chain) is still alive at the next owner's mode
+        // apply is the living-process handoff difference: process-first acquires (nothing to
+        // finalize) latch on the glass, re-acquires don't. Finalize deterministically BEFORE
+        // handing the target back so a released process looks as dead to the kernel as an exited
+        // one. Runs only on release/recovery — never per-frame — and stays well under the ~5s
+        // watchdog budget.
+        _displayDevice = null!; _taskPool = null!; _source = null!; _primary = null!;
+        GC.Collect();
+        GC.WaitForPendingFinalizers();
+        GC.Collect();
+        // Hand the target back to the OS explicitly before dropping the manager.
+        // DisplayManager.Dispose is documented to revoke ownership of all targets, but a
+        // dispose-only release from a LIVING process leaves the glass scanning this session's last
+        // primary: the next owner's acquire, mode apply, presents and fences all report success
+        // while the panel never latches onto its scanout. Boot handoffs (previous owner process
+        // dead) always latched. ReleaseTarget is the explicit ownership hand-off.
+        TryReleaseTargetQuiet(_target);
+        _target = null!;
         _mgr?.Dispose(); _mgr = null!;
+    }
+
+    /// <summary>Log the kernel's view of our scanout source (Active / PoweredOff / Invalid /
+    /// OwnedByAnotherDevice / Unowned). Presents, fences and captures all read the FRAMEBUFFER and
+    /// cannot see a panel that never latched; this is the only API-side signal that reflects the
+    /// glass. Win11+ (UniversalApiContract v14) and best-effort only.</summary>
+    private void LogSourceStatus(string when)
+    {
+        if (_source is null) return;
+        try { _log?.Invoke(LogLevel.Info, $"scanout source status ({when}): {_source.Status}"); }
+        catch { /* older contract without DisplaySource.Status — stay quiet */ }
+    }
+
+    /// <summary>Best-effort <see cref="DisplayManager.ReleaseTarget"/>: releasing a target we no
+    /// longer own (or a stale one) throws, and no release path may fail because of that.</summary>
+    private void TryReleaseTargetQuiet(DisplayTarget? target)
+    {
+        if (target is null || _mgr is null) return;
+        try { _mgr.ReleaseTarget(target); }
+        catch (Exception ex) { _log?.Invoke(LogLevel.Warn, $"ReleaseTarget failed: {ex.Message}"); }
     }
 
     public void Dispose()
     {
         ReleaseGraphics();
+        _consoleWatcher?.Dispose();
         _idle?.Dispose(); _idle = null; // the persistent not-owned fallback lives until the session is torn down
     }
 

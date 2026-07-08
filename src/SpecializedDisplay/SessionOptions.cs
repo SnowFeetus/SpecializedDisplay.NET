@@ -57,6 +57,17 @@ public sealed class AcquireOptions
     // (fall back to rebuild-only). A sleeping panel is not fatal, so this path never throws.
     public double FenceDeadReacquireAfterMs { get; init; } = 15000;
 
+    // Console-wake re-acquire (hardware-traced 2026-07-06). On desktop wake Windows re-powers only
+    // the monitors in the desktop topology — an exclusively-owned specialized target stays dark
+    // until its owner re-applies a mode, and the session's only other signal (a blocking vblank)
+    // can never arrive on a powered-down scanout (observed: 14h dark panel on an awake desktop).
+    // When the console display state transitions to ON while the session is display-off throttled,
+    // wait this grace (a vblank that resumes by itself within it — a merely-backgrounded session
+    // reconnecting — cancels the escalation), then release + re-acquire to re-light the panel.
+    // 0 disables the console-wake path. Retries on the FenceDeadReacquireAfterMs cadence if the
+    // re-acquire itself exhausts (so a still-dark panel keeps trying while the desktop is awake).
+    public double ConsoleWakeGraceMs { get; init; } = 2000;
+
     // Fence waits.
     public int RenderFenceTimeoutMs { get; init; } = 500;
     public int VBlankFenceTimeoutMs { get; init; } = 500;
